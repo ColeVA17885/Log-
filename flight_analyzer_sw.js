@@ -1,4 +1,4 @@
-const CACHE = 'flight-analyzer-v3';
+const CACHE = 'flight-analyzer-v5';
 const ASSETS = ['./flight_analyzer.html', './flight_analyzer_manifest.json'];
 
 self.addEventListener('install', e => {

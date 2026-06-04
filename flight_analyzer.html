@@ -395,7 +395,7 @@ const EV_CODES = {
   24:'Landed',25:'Throw Started',28:'Parachute Released'
 };
 const FAILSAFE_SUBSYSTEMS = new Set([5,6,7,8,9,10,18,24,31]);
-const NOISY_SUBSYSTEMS    = new Set([11,19,20,21,22,25]);
+const NOISY_SUBSYSTEMS    = new Set([11,12,19,20,21,22,25]);
 
 /* ===================================================================
  * DataFlash .bin Parser
@@ -649,7 +649,12 @@ function computeFlightStats(messages) {
   }
   const rcou = messages.RCOU || [];
   if (rcou.length) {
-    for (const ch of ['C1','C2','C3','C4']) {
+    // Use airframe-configured motor channels if available, else default 1-4
+    const motorNums = (computeFlightStats._motors && computeFlightStats._motors.length)
+      ? computeFlightStats._motors
+      : [1,2,3,4];
+    for (const n of motorNums) {
+      const ch = 'C' + n;
       const vals = collect(rcou, m=>m[ch]);
       if (vals.length) stats[`rcou_${ch}`] = vals;
     }
@@ -898,10 +903,8 @@ function analyzeLog(messages, baseline) {
         const t = vs.find(v=>v[1] < 4.5)[0];
         addAnomaly(t, 'Servo Rail', `VServo critically low: ${minVs.toFixed(2)}V — BEC brownout risk`, 'critical', `${minVs.toFixed(2)}V`);
         addEvent(t, 'error', `Servo rail brownout: ${minVs.toFixed(2)}V`, 'critical');
-      } else if (minVs < 4.8) {
-        const t = vs.find(v=>v[1] < 4.8)[0];
-        addAnomaly(t, 'Servo Rail', `VServo low: ${minVs.toFixed(2)}V — marginal under load`, 'warning', `${minVs.toFixed(2)}V`);
       }
+      // (4.5–4.8V "marginal" tier suppressed — too noisy on normal flights)
       // sag
       for (let i = 1; i < vs.length; i++) {
         const dt = vs[i][0] - vs[i-1][0], dv = vs[i][1] - vs[i-1][1];
@@ -980,9 +983,12 @@ function analyzeLog(messages, baseline) {
     }
   }
 
-  // ── Motors ──
+  // ── Motors ── (respect airframe-configured channels)
   if (rcou.length) {
-    const chs = ['C1','C2','C3','C4','C5','C6','C7','C8'].filter(c => rcou[0][c] != null);
+    const cfgMotors = analyzeLog._motors;
+    const chs = (cfgMotors && cfgMotors.length)
+      ? cfgMotors.map(n => 'C'+n).filter(c => rcou[0][c] != null)
+      : ['C1','C2','C3','C4','C5','C6','C7','C8'].filter(c => rcou[0][c] != null);
     let satFound = false, imbalFound = false;
     for (const r of rcou) {
       if (r._timestamp < armTime) continue;
@@ -1182,11 +1188,23 @@ function dbAll(store) { return new Promise((res, rej) => { const r = tx(store).g
 function dbDel(store, key) { return new Promise((res, rej) => { const r = tx(store,'readwrite').delete(key); r.onsuccess=()=>res(); r.onerror=()=>rej(r.error); }); }
 
 async function listAirframes() { return await dbAll('airframes'); }
-async function createAirframe(name) {
+async function createAirframe(name, motors=null) {
   const id = 'af_' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
-  await dbPut('airframes', { id, name, createdAt: Date.now() });
+  await dbPut('airframes', { id, name, motors, createdAt: Date.now() });
   await dbPut('baselines', { airframeId: id, stats: {}, n_flights: 0 });
   return id;
+}
+async function getAirframe(id) { return await dbGet('airframes', id); }
+async function updateAirframe(id, patch) {
+  const a = await getAirframe(id);
+  if (a) await dbPut('airframes', { ...a, ...patch });
+}
+// Returns array of channel numbers like [1,2,4]; null = use all detected
+function defaultMotorsForName(name='') {
+  const n = name.toLowerCase();
+  if (n.includes('switchblade')) return [1,2,4];
+  if (n.includes('vector'))      return [1,2,3,4,5,6];
+  return null;
 }
 async function deleteAirframe(id) { await dbDel('airframes', id); await dbDel('baselines', id); }
 async function getBaseline(id) { return (await dbGet('baselines', id)) || { airframeId: id, stats: {}, n_flights: 0 }; }
@@ -1268,27 +1286,45 @@ function setMode(mode) {
   _mode = mode;
   $$('.mode-toggle').forEach(el => el.classList.toggle('active', el.dataset.mode === mode));
   const dz = $('#dropZone');
+  const hasResults = !$('#results').classList.contains('hidden');
   if (mode === 'train') {
+    // Always show the drop zone in train mode, even if a log is loaded
+    dz.classList.remove('hidden');
     dz.classList.add('train-mode');
     $('#dropIcon').textContent = '📚';
     $('#dropTitle').textContent = 'Drop known-good .bin files here to train baseline';
-    $('#dropSub').innerHTML = 'You can drop multiple files at once.<br>Each flight teaches the app what "normal" looks like for the active airframe.';
+    $('#dropSub').innerHTML = 'Drop multiple files at once to bulk-train.<br>Each flight teaches the app what "normal" looks like for the active airframe.';
   } else {
     dz.classList.remove('train-mode');
     $('#dropIcon').textContent = '🛩️';
     $('#dropTitle').textContent = 'Drop a .bin log here to analyze';
     $('#dropSub').innerHTML = '…or click to browse. The app compares against the active airframe\'s baseline.';
+    // In analyze mode, hide the drop zone only if results are already showing
+    // (use the "Load .bin" button in the header to load another log)
+    if (hasResults) dz.classList.add('hidden');
   }
 }
 $$('.mode-toggle').forEach(el => el.onclick = () => setMode(el.dataset.mode));
 
 $('#newAirframeBtn').onclick = async () => {
-  const name = prompt('Airframe name (e.g. "Hadron #1", "Test bench quad")');
+  const name = prompt('Airframe name (e.g. "Switchblade", "Vector", "Hadron #1")');
   if (!name) return;
-  const id = await createAirframe(name.trim());
+  const suggested = defaultMotorsForName(name) || [1,2,3,4];
+  const motorStr = prompt(
+    `Which motor channels does "${name.trim()}" use?\n\n` +
+    `Enter comma-separated channel numbers (1-8).\n` +
+    `Examples:\n  Quad: 1,2,3,4\n  Switchblade: 1,2,4\n  Vector / Hex: 1,2,3,4,5,6\n  Octa: 1,2,3,4,5,6,7,8`,
+    suggested.join(',')
+  );
+  let motors = null;
+  if (motorStr) {
+    motors = motorStr.split(',').map(s => parseInt(s.trim(),10)).filter(n => n>=1 && n<=12);
+    if (!motors.length) motors = null;
+  }
+  const id = await createAirframe(name.trim(), motors);
   await setActiveAirframe(id);
   await refreshAirframes();
-  toast(`Created airframe: ${name}`, 'success');
+  toast(`Created airframe: ${name.trim()} (motors: ${motors ? motors.join(',') : 'auto'})`, 'success');
 };
 
 $('#airframeSelect').onchange = async (e) => {
@@ -1301,10 +1337,27 @@ $('#manageBaselineBtn').onclick = async () => {
   if (!id) { toast('Select an airframe first', 'error'); return; }
   const af = (await listAirframes()).find(a=>a.id === id);
   const bl = await getBaseline(id);
+  const motorStr = af.motors ? af.motors.join(',') : 'auto (all detected)';
   const action = prompt(
-    `Airframe: ${af.name}\nBaseline: ${bl.n_flights || 0} flights trained, ${Object.keys(bl.stats||{}).length} signals.\n\nTo TRAIN: switch to "Train baseline" mode below and drop .bin files.\n\nFor airframe management, type:\n  "reset"  — wipe baseline (keep airframe)\n  "delete" — delete this airframe entirely\n  (cancel to dismiss)`
+    `Airframe: ${af.name}\nMotors: ${motorStr}\nBaseline: ${bl.n_flights || 0} flights trained, ${Object.keys(bl.stats||{}).length} signals.\n\nTo TRAIN: switch to "Train baseline" mode below and drop .bin files.\n\nManagement options — type:\n  "motors" — set which motor channels this airframe uses\n  "reset"  — wipe baseline (keep airframe)\n  "delete" — delete this airframe entirely\n  (cancel to dismiss)`
   );
-  if (action === 'reset') {
+  if (action === 'motors') {
+    const newStr = prompt(
+      `Motor channels for "${af.name}"\n\nComma-separated 1-8.\nLeave blank to auto-detect all RCOU channels.\n\nExamples:\n  Switchblade: 1,2,4\n  Vector: 1,2,3,4,5,6\n  Quad: 1,2,3,4`,
+      af.motors ? af.motors.join(',') : ''
+    );
+    if (newStr !== null) {
+      const motors = newStr.trim()
+        ? newStr.split(',').map(s=>parseInt(s.trim(),10)).filter(n=>n>=1 && n<=12)
+        : null;
+      await updateAirframe(id, { motors: motors && motors.length ? motors : null });
+      if (bl.n_flights > 0 && confirm('Motor channels changed — wipe baseline? (Recommended since old baseline includes channels you no longer care about.)')) {
+        await saveBaseline(id, { airframeId: id, stats: {}, n_flights: 0 });
+      }
+      await refreshAirframes();
+      toast(`Motors set to: ${motors ? motors.join(',') : 'auto'}`, 'success');
+    }
+  } else if (action === 'reset') {
     if (confirm('Wipe baseline for ' + af.name + '?')) {
       await saveBaseline(id, { airframeId: id, stats: {}, n_flights: 0 });
       await refreshAirframes();
@@ -1357,10 +1410,16 @@ async function handleLog(file) {
     });
     $('#dropProgressLabel').textContent = 'Analyzing…';
     const airframeId = await getActiveAirframe();
+    const airframe = airframeId ? await getAirframe(airframeId) : null;
     const baseline = airframeId ? (await getBaseline(airframeId)).stats : {};
+    // Configure motor channels for analysis + charts
+    analyzeLog._motors = airframe?.motors || null;
+    renderCharts._motors = airframe?.motors || null;
+    computeFlightStats._motors = airframe?.motors || null;
     const result = analyzeLog(messages, baseline);
     result.fileName = file.name;
     result.airframeId = airframeId;
+    result.airframe = airframe;
     result.baseline = baseline;
     renderResults(result);
     $('#dropZone').classList.add('hidden');
@@ -1375,6 +1434,8 @@ async function handleLog(file) {
 async function handleTrain(files) {
   const id = await getActiveAirframe();
   if (!id) { toast('Select an airframe first', 'error'); return; }
+  const af = await getAirframe(id);
+  computeFlightStats._motors = af?.motors || null;   // train only configured motors
   $('#dropProgress').classList.remove('hidden');
   let bl = await getBaseline(id);
   bl.stats = bl.stats || {};
@@ -1720,7 +1781,10 @@ function renderCharts(r) {
 
   /* ─── 5. RCOU Motors ─── */
   const rcou = m.RCOU || [];
-  const motorChs = ['C1','C2','C3','C4','C5','C6','C7','C8'].filter(c => rcou[0] && rcou[0][c] != null);
+  const cfgMotors = renderCharts._motors;
+  const motorChs = (cfgMotors && cfgMotors.length)
+    ? cfgMotors.map(n => 'C'+n).filter(c => rcou[0] && rcou[0][c] != null)
+    : ['C1','C2','C3','C4','C5','C6','C7','C8'].filter(c => rcou[0] && rcou[0][c] != null);
   const motorColors = ['#ef4444','#f59e0b','#eab308','#10b981','#06b6d4','#3b82f6','#8b5cf6','#ec4899'];
   const motorTraces = motorChs.map((c,i) => {
     const [x,y] = series(rcou, v=>v[c]);
@@ -1904,6 +1968,14 @@ $('#installBtn').onclick = async () => {
 
 (async () => {
   await openDB();
+  // Backfill: any existing airframe with no motors config gets defaults inferred from name
+  for (const a of await listAirframes()) {
+    if (a.motors === undefined) {
+      const guessed = defaultMotorsForName(a.name);
+      await updateAirframe(a.id, { motors: guessed });
+      if (guessed) console.log(`Auto-configured ${a.name} → motors ${guessed.join(',')}`);
+    }
+  }
   await refreshAirframes();
   // Register service worker (required for PWA install)
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
